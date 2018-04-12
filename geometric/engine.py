@@ -436,6 +436,60 @@ class Psi4(Engine):
         gradient = np.array(gradient, dtype=np.float64).ravel()
         return energy, gradient
 
+class QCDB(Engine):
+    """
+    Run a QCDB energy and gradient calculation.
+    """
+    def __init__(self, molecule=None):
+        # molecule.py can not parse psi4 input yet, so we use self.load_psi4_input() as a walk around
+        if molecule is None:
+            # create a fake molecule
+            molecule = Molecule()
+            molecule.elem = ['H']
+            molecule.xyzs = [[[0,0,0]]]
+        super(QCDB, self).__init__(molecule)
+        self.threads = None
+
+    def nt(self):
+        if self.threads is not None:
+            return " -n %i" % self.threads
+        else:
+            return ""
+
+    def set_nt(self, threads):
+        self.threads = threads
+
+    def load_qcdb_input(self, jsonin):
+        import yaml
+        with open(jsonin, 'r') as handle:
+            jobrec = yaml.load(handle)
+        molrec = jobrec['molecule']
+        coords = [np.array(molrec['geom']).reshape(-1, 3)]
+        self.M = Molecule()
+        self.M.elem = molrec['elem']
+        self.M.xyzs = coords
+        self.qcdb_job = jobrec['template']
+        self.qcdb_mol = {'molecule': molrec}
+
+    def calc_new(self, coords, dirname):
+        if not os.path.exists(dirname): 
+            os.makedirs(dirname)
+        # Convert coordinates back to the input
+#        self.qcdb_mol['molecule']['geom'] = coords[:].tolist()
+        self.M.xyzs[0] = coords.reshape(-1, 3) * bohr2ang
+        self.qcdb_mol['molecule']['geom'] = self.M.xyzs[0].tolist()
+        # Write Psi4 input.dat
+        import yaml
+        ymolrec = yaml.dump(self.qcdb_mol)
+        yamlin = '\n'.join([self.qcdb_job, ymolrec])
+        # Run Psi4
+        #subprocess.call('psi4%s input.dat' % self.nt(), cwd=dirname, shell=True)
+        import qcdb
+        jobrec = qcdb.yaml_run(yamlin)
+        # Read energy and gradients from Psi4 output
+        energy = float(jobrec['qcvars']['CURRENT ENERGY'].data)
+        gradient = jobrec['qcvars']['CURRENT GRADIENT'].data.reshape((-1))
+        return energy, gradient
 
 
 class QChem(Engine):
@@ -515,3 +569,15 @@ class Gromacs(Engine):
         Gradient = EF[0, 1:] / fqcgmx
         os.chdir(cwd)
         return Energy, Gradient
+
+
+def _nre(Z, geom):
+    """Nuclear repulsion energy"""
+
+    nre = 0.
+    for at1 in range(geom.shape[0]):
+        for at2 in range(at1):
+            dist = np.linalg.norm(geom[at1] - geom[at2])
+            nre += Z[at1] * Z[at2] / dist
+    return nre
+

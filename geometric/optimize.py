@@ -5,7 +5,7 @@ import numpy as np
 from copy import deepcopy
 from collections import OrderedDict
 from geometric.internal import *
-from geometric.engine import set_tcenv, load_tcin, TeraChem, Psi4, QChem, Gromacs
+from geometric.engine import set_tcenv, load_tcin, TeraChem, Psi4, QCDB, QChem, Gromacs
 from geometric.rotate import get_rot, sorted_eigh, calc_fac_dfac
 from forcebalance.gmxio import GMX
 from forcebalance.molecule import Molecule, Elements
@@ -848,6 +848,7 @@ class OptParams(object):
         self.Convergence_gmax = 4.5e-4
         self.Convergence_drms = 1.2e-3
         self.Convergence_dmax = 1.8e-3
+        #self.return_convcrit('return_convcrit', False)
 
 def Optimize(coords, molecule, IC, engine, dirname, params, xyzout=None, xyzout2=None):
     """
@@ -872,6 +873,9 @@ def Optimize(coords, molecule, IC, engine, dirname, params, xyzout=None, xyzout2
     -------
     np.ndarray
         Nx3 array of optimized Cartesian coordinates in atomic units
+    dict
+        convergence crit, only if params.return_convcrit True
+
     """
     progress = deepcopy(molecule)
     progress2 = deepcopy(molecule)
@@ -1036,6 +1040,13 @@ def Optimize(coords, molecule, IC, engine, dirname, params, xyzout=None, xyzout2
         Converged_drms = rms_displacement < Convergence_drms
         Converged_dmax = max_displacement < Convergence_dmax
         BadStep = Quality < 0
+        convcrit = {
+            'Delta E': (np.abs(E-Eprev), Convergence_energy),
+            'RMS G': (rms_gradient, Convergence_grms),
+            'Max G': (max_gradient, Convergence_gmax),
+            'RMS D': (rms_displacement, Convergence_drms),
+            'Max D': (max_displacement, Convergence_dmax),
+            }
         # Print status
         print("Step %4i :" % Iteration, end=' '),
         print("Displace = %s%.3e\x1b[0m/%s%.3e\x1b[0m (rms/max)" % ("\x1b[92m" if Converged_drms else "\x1b[0m", rms_displacement, "\x1b[92m" if Converged_dmax else "\x1b[0m", max_displacement), end=' '),
@@ -1188,7 +1199,7 @@ def Optimize(coords, molecule, IC, engine, dirname, params, xyzout=None, xyzout2
                 print("Eigenvalues below %.4e (%.4e) - returning guess" % (params.epsilon, np.min(Eig1)))
                 H = IC.guess_hessian(coords)
             # Then it's on to the next loop iteration!
-    return X
+    return X, convcrit
 
 def CheckInternalGrad(coords, molecule, IC, engine, dirname, verbose=False):
     """ Check the internal coordinate gradient using finite difference. """
@@ -1307,14 +1318,15 @@ def get_molecule_engine(**kwargs):
     ### Set up based on which quantum chemistry code we're using.
     qchem = kwargs.get('qchem', False)
     psi4 = kwargs.get('psi4', False)
+    qcdb = kwargs.get('qcdb', False)
     gmx = kwargs.get('gmx', False)
     pdb = kwargs.get('pdb', None)
     frag = kwargs.get('frag', False)
     inputf = kwargs.get('input')
     nt = kwargs.get('nt', None)
 
-    if sum([qchem, psi4, gmx]) > 1:
-        raise RuntimeError("Do not specify more than one of --qchem, --psi4, --gmx")
+    if sum([qchem, psi4, qcdb, gmx]) > 1:
+        raise RuntimeError("Do not specify more than one of --qchem, --psi4, --qcdb, --gmx")
     if qchem:
         # The file from which we make the Molecule object
         if pdb is not None:
@@ -1344,6 +1356,10 @@ def get_molecule_engine(**kwargs):
         M = engine.M
         if nt is not None:
             engine.set_nt(nt)
+    elif qcdb:
+        engine = QCDB()
+        engine.load_qcdb_input(inputf)
+        M = engine.M
     else:
         set_tcenv()
         tcin = load_tcin(inputf)
@@ -1460,7 +1476,7 @@ def run_optimizer(**kwargs):
         else:
             xyzout = prefix+".xyz"
             xyzout2="opt.xyz"
-        opt_coords = Optimize(coords, M, IC, engine, dirname, params, xyzout,xyzout2)
+        opt_coords, convcrit = Optimize(coords, M, IC, engine, dirname, params, xyzout,xyzout2)
     else:
         # Run a constrained geometry optimization
         if type(IC) in [CartesianCoordinates, PrimitiveInternalCoordinates]:
@@ -1480,11 +1496,33 @@ def run_optimizer(**kwargs):
             else:
                 xyzout = prefix+".xyz"
                 xyzout2="opt.xyz"
-            coords = Optimize(coords, M, IC, engine, dirname, params, xyzout,xyzout2)
-            print
+            coords, convcrit = Optimize(coords, M, IC, engine, dirname, params, xyzout,xyzout2)
     print_msg()
+    return (opt_coords, convcrit)
 
-def main():
+def json_run(tricrec):
+
+    prov = {}
+    prov["version"] = "0.1" #geometric.__version__
+    prov["routine"] = "geometric.run_json"
+    prov["creator"] = "geomeTRIC"
+    tricrec["provenance"] = prov
+    argparser = parseargs()
+    args =  argparser.parse_args(tricrec['argparse'])
+    with open('tmp_tricin.yaml', 'w') as handle:
+        handle.write(tricrec['template'])
+
+#args Namespace(check=0, constraints=None, coords=None, coordsys='tric', displace=False, enforce=False, epsilon=1e-05, fdcheck=False, frag=False, gmx=False, input='trictest3.yaml', maxiter=300, nt=None, pdb=None, prefix=None, psi4=False, qccnv=False, qcdb=True, qcdir=None, qchem=False, radii=['Na', '0.0'], reset=False, rfo=False, tmax=0.3, trust=0.1, verbose=False)
+
+    coords, convcrit = run_optimizer(**vars(args))
+
+    tricrec['coords'] = coords
+    tricrec['convcrit'] = convcrit
+
+    return tricrec
+
+
+def parseargs():
     "Read user's input"
 
     parser = argparse.ArgumentParser()
@@ -1493,6 +1531,7 @@ def main():
                         'Internal Coordinates (default).')
     parser.add_argument('--qchem', action='store_true', help='Run optimization in Q-Chem (pass Q-Chem input).')
     parser.add_argument('--psi4', action='store_true', help='Compute gradients in Psi4.')
+    parser.add_argument('--qcdb', action='store_true', help='Compute gradients in QCDB.')
     parser.add_argument('--gmx', action='store_true', help='Compute gradients in Gromacs (requires conf.gro, topol.top, shot.mdp).')
     parser.add_argument('--prefix', type=str, default=None, help='Specify a prefix for output file and temporary directory.')
     parser.add_argument('--displace', action='store_true', help='Write out the displacements of the coordinates.')
@@ -1515,10 +1554,14 @@ def main():
     parser.add_argument('--nt', type=int, help='Specify number of threads for running in parallel (for TeraChem this should be number of GPUs)')
     parser.add_argument('input', type=str, help='TeraChem or Q-Chem input file')
     parser.add_argument('constraints', type=str, nargs='?', help='Constraint input file (optional)')
-    #print(' '.join(sys.argv))
+    return parser
+
+def main(parser):
+    print(' '.join(sys.argv))
     args = parser.parse_args(sys.argv[1:])
+    print('args', args)
     # Run the optimizer.
     run_optimizer(**vars(args))
 
 if __name__ == "__main__":
-    main()
+    main(parseargs())
